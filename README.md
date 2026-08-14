@@ -33,9 +33,9 @@ A config file can be created in the project root or the users home folder. When 
 
  A jamfapi.cfg file can provide the following variables:
 
- - username
- - password
- - url
+- username
+- password
+- url
 
 ### Prerequisites
 git2jss requires [Python 3.6](https://www.python.org/downloads/) and the python modules listed in `requirements.txt`
