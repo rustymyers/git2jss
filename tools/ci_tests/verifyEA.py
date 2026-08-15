@@ -45,7 +45,7 @@ else:
 
 def get_uapi_token():
     """
-    fetches api token
+    Fetches api token.
     """
     jamf_test_url = url + "/api/v1/auth/token"
     response = requests.post(url=jamf_test_url, auth=(username, password), timeout=5)
@@ -55,7 +55,7 @@ def get_uapi_token():
 
 def invalidate_uapi_token(uapi_token):
     """
-    invalidates api token
+    Invalidates api token.
     """
     jamf_test_url = url + "/api/v1/auth/invalidate-token"
     headers = {"Accept": "*/*", "Authorization": "Bearer " + uapi_token}
@@ -76,7 +76,8 @@ def read_file(file_path):
 
 
 def build_computers_data_object(token, group_id):
-    """Builds computer data into local file
+    """
+    Builds computer data into local file.
     params: token, group_id
     returns: computers objects json
     """
@@ -119,7 +120,8 @@ def build_computers_data_object(token, group_id):
 
 
 def compare_computer(computer_id):
-    """Compares a computer id record from live to cached copy on disk
+    """
+    Compares a computer id record from live to cached copy on disk.
     params: computer_id
     returns: None
     """
