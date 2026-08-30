@@ -1,76 +1,413 @@
 #!/usr/bin/env python3
 # pylint: disable=missing-docstring,invalid-name
-import warnings
-import os
-from os.path import dirname, join, realpath
-import sys
-import getpass
+
+"""Synchronize Jamf Pro scripts and computer extension attributes from a repository."""
+
+from __future__ import annotations
+
 import argparse
-import logging
 import asyncio
-import async_timeout
-import aiohttp
-import uvloop
 import configparser
+import getpass
+import logging
+import os
+import subprocess
+import sys
+import warnings
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Sequence
+from urllib.parse import quote
+
+import aiohttp
 import requests
 from defusedxml import ElementTree as eTree
+
+try:
+    import uvloop
+except ImportError:
+    uvloop = None
+
 
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(levelname)7s: %(message)s",
     stream=sys.stderr,
 )
-LOG = logging.getLogger("")
+LOG = logging.getLogger(__name__)
 
-# The Jenkins file will contain a list of changes scripts and eas
-# in $scripts and $eas.
-# Use this variable to add a Slack emoji in front of each item if
-# you use a post-build action for a Slack custom message
 SLACK_EMOJI = ":white_check_mark: "
-SUPPORTED_SCRIPT_EXTENSIONS = ("sh", "py", "pl", "swift", "rb")
-SUPPORTED_EA_EXTENSIONS = ("sh", "py", "pl", "swift", "rb")
-CATEGORIES = []
+SUPPORTED_SCRIPT_EXTENSIONS = {"sh", "py", "pl", "swift", "rb"}
+SUPPORTED_EA_EXTENSIONS = {"sh", "py", "pl", "swift", "rb"}
+SUCCESS_STATUSES = {200, 201}
 
 
-def get_uapi_token(jamf_url, username, password):
-    """Request a Jamf Pro bearer token."""
-    token_url = f"{jamf_url}/api/v1/auth/token"
+@dataclass(frozen=True)
+class AppSettings:
+    """Resolved application settings."""
 
-    response = requests.post(
-        url=token_url,
-        auth=(username, password),
-        timeout=10,
-    )
-    response.raise_for_status()
-
-    response_json = response.json()
-    return response_json["token"]
+    url: str
+    username: str
+    password: str
+    sync_path: Path
 
 
-def invalidate_uapi_token(jamf_url, uapi_token):
-    """Invalidate a Jamf Pro bearer token."""
-    invalidate_url = f"{jamf_url}/api/v1/auth/invalidate-token"
-    headers = {
-        "Accept": "*/*",
-        "Authorization": f"Bearer {uapi_token}",
-    }
+@dataclass
+class RuntimeContext:
+    """Mutable state shared by one synchronization run."""
 
-    response = requests.post(
-        url=invalidate_url,
-        headers=headers,
-        timeout=10,
-    )
+    args: argparse.Namespace
+    settings: AppSettings
+    token: str = ""
+    changed_scripts: list[str] = field(default_factory=list)
+    changed_ext_attrs: list[str] = field(default_factory=list)
+    categories: set[str] = field(default_factory=set)
 
-    if response.status_code not in (200, 204):
-        LOG.warning(
-            "Unable to invalidate Jamf token. HTTP status: %s",
-            response.status_code,
+    @property
+    def url(self) -> str:
+        return self.settings.url
+
+    @property
+    def username(self) -> str:
+        return self.settings.username
+
+    @property
+    def password(self) -> str:
+        return self.settings.password
+
+    @property
+    def sync_path(self) -> Path:
+        return self.settings.sync_path
+
+
+class JamfSync:
+    """Manage asynchronous Jamf Classic API synchronization operations."""
+
+    def __init__(self, context: RuntimeContext):
+        self.ctx = context
+        self.session: aiohttp.ClientSession | None = None
+        self.semaphore = asyncio.BoundedSemaphore(context.args.limit)
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {
+            "Accept": "application/xml",
+            "Content-Type": "application/xml",
+            "Authorization": f"Bearer {self.ctx.token}",
+        }
+
+    async def run(self) -> None:
+        """Create the HTTP session and run all synchronization operations."""
+        connector = aiohttp.TCPConnector(
+            ssl=False if self.ctx.args.do_not_verify_ssl else None
+        )
+        timeout = aiohttp.ClientTimeout(total=self.ctx.args.timeout)
+
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers=self.headers,
+        ) as session:
+            self.session = session
+            self.ctx.categories = await self.get_existing_categories()
+            LOG.debug("Found %d Jamf categories", len(self.ctx.categories))
+
+            script_results, ea_results = await asyncio.gather(
+                self.upload_scripts(),
+                self.upload_extension_attributes(),
+            )
+
+            failures = [
+                *[name for name, status in script_results if status not in SUCCESS_STATUSES],
+                *[name for name, status in ea_results if status not in SUCCESS_STATUSES],
+            ]
+            if failures:
+                raise RuntimeError(
+                    "One or more Jamf objects failed to upload: " + ", ".join(failures)
+                )
+
+    def require_session(self) -> aiohttp.ClientSession:
+        if self.session is None:
+            raise RuntimeError("JamfSync session has not been initialized")
+        return self.session
+
+    async def request(self, method: str, endpoint: str, **kwargs) -> tuple[int, str]:
+        """Perform one concurrency-limited Jamf request and return status/body."""
+        session = self.require_session()
+        url = f"{self.ctx.url}{endpoint}"
+
+        async with self.semaphore:
+            async with session.request(method, url, **kwargs) as response:
+                body = await response.text()
+                if self.ctx.args.verbose:
+                    LOG.debug("%s %s returned HTTP %s", method, endpoint, response.status)
+                return response.status, body
+
+    async def get_existing_categories(self) -> set[str]:
+        status, body = await self.request("GET", "/JSSResource/categories")
+        if status not in SUCCESS_STATUSES:
+            LOG.warning("Unable to retrieve Jamf categories: HTTP %s", status)
+            return set()
+
+        root = eTree.fromstring(body)
+        return {
+            category.text
+            for category in root.findall("category/name")
+            if category.text
+        }
+
+    async def upload_scripts(self) -> list[tuple[str, int]]:
+        scripts = self._selected_directories(
+            root=self.ctx.sync_path / "scripts",
+            changed_names=self.ctx.changed_scripts,
+            object_label="scripts",
         )
 
-def parse_arguments():
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="Sync repository with Jamf Pro")
+        if not scripts:
+            LOG.info("No scripts selected for upload")
+            return []
 
+        results = await asyncio.gather(
+            *(self.upload_script(script_name) for script_name in scripts)
+        )
+        return list(zip(scripts, results))
+
+    async def upload_script(self, script_name: str) -> int:
+        script_dir = self.ctx.sync_path / "scripts" / script_name
+        script_file = self._first_file_with_extensions(
+            script_dir,
+            SUPPORTED_SCRIPT_EXTENSIONS,
+        )
+
+        if script_file is None:
+            LOG.warning("No script file found in scripts/%s", script_name)
+            return 0
+
+        script_contents = script_file.read_text(encoding="utf-8")
+        template = await self.get_script_template(script_name)
+        name = self._ensure_name(template, script_name)
+
+        contents_element = template.find("script_contents")
+        if contents_element is None:
+            contents_element = eTree.SubElement(template, "script_contents")
+        contents_element.text = script_contents
+
+        status = await self._create_or_update(
+            resource="scripts",
+            name=name,
+            template=template,
+        )
+        self._log_upload_result("script", name, status)
+        return status
+
+    async def get_script_template(self, script_name: str):
+        object_dir = self.ctx.sync_path / "scripts" / script_name
+        template = await self._load_local_or_remote_template(
+            object_dir=object_dir,
+            fallback_path=self.ctx.sync_path / "templates" / "script.xml",
+            resource="scripts",
+            lookup_name=script_name,
+        )
+
+        self._normalize_category(template, add_none=False)
+        self._ensure_name(template, script_name)
+        self._log_xml(template)
+        return template
+
+    async def upload_extension_attributes(self) -> list[tuple[str, int]]:
+        extension_attributes = self._selected_directories(
+            root=self.ctx.sync_path / "extension_attributes",
+            changed_names=self.ctx.changed_ext_attrs,
+            object_label="extension attributes",
+        )
+
+        if not extension_attributes:
+            LOG.info("No extension attributes selected for upload")
+            return []
+
+        results = await asyncio.gather(
+            *(
+                self.upload_extension_attribute(ext_attr)
+                for ext_attr in extension_attributes
+            )
+        )
+        return list(zip(extension_attributes, results))
+
+    async def upload_extension_attribute(self, ext_attr: str) -> int:
+        extension_attribute_dir = (
+            self.ctx.sync_path / "extension_attributes" / ext_attr
+        )
+        script_file = self._first_file_with_extensions(
+            extension_attribute_dir,
+            SUPPORTED_EA_EXTENSIONS,
+        )
+
+        if script_file is None:
+            LOG.warning(
+                "No script file found in extension_attributes/%s; "
+                "uploading the XML template without a script",
+                ext_attr,
+            )
+            script_contents = None
+        else:
+            script_contents = script_file.read_text(encoding="utf-8")
+
+        template = await self.get_ea_template(ext_attr)
+        name = self._ensure_name(template, ext_attr)
+
+        if script_contents is not None:
+            script_element = template.find("input_type/script")
+            if script_element is None:
+                input_type = template.find("input_type")
+                if input_type is None:
+                    input_type = eTree.SubElement(template, "input_type")
+                script_element = eTree.SubElement(input_type, "script")
+            script_element.text = script_contents
+
+        status = await self._create_or_update(
+            resource="computerextensionattributes",
+            name=name,
+            template=template,
+        )
+        self._log_upload_result("extension attribute", name, status)
+        return status
+
+    async def get_ea_template(self, ext_attr: str):
+        object_dir = self.ctx.sync_path / "extension_attributes" / ext_attr
+        template = await self._load_local_or_remote_template(
+            object_dir=object_dir,
+            fallback_path=self.ctx.sync_path / "templates" / "ea.xml",
+            resource="computerextensionattributes",
+            lookup_name=ext_attr,
+        )
+
+        self._normalize_category(template, add_none=True)
+        self._ensure_name(template, ext_attr)
+        self._log_xml(template)
+        return template
+
+    async def _load_local_or_remote_template(
+        self,
+        object_dir: Path,
+        fallback_path: Path,
+        resource: str,
+        lookup_name: str,
+    ):
+        xml_files = sorted(
+            path for path in object_dir.iterdir() if path.is_file() and path.suffix.lower() == ".xml"
+        )
+
+        if xml_files:
+            return eTree.parse(str(xml_files[0])).getroot()
+
+        endpoint = f"/JSSResource/{resource}/name/{quote(lookup_name, safe='')}"
+        status, body = await self.request("GET", endpoint)
+
+        if status == 200:
+            return eTree.fromstring(body)
+
+        if not fallback_path.is_file():
+            raise FileNotFoundError(f"Missing fallback template: {fallback_path}")
+
+        return eTree.parse(str(fallback_path)).getroot()
+
+    async def _create_or_update(self, resource: str, name: str, template) -> int:
+        encoded_name = quote(name, safe="")
+        lookup_endpoint = f"/JSSResource/{resource}/name/{encoded_name}"
+        lookup_status, _ = await self.request("GET", lookup_endpoint)
+        payload = eTree.tostring(template, encoding="utf-8")
+
+        if lookup_status == 200:
+            status, body = await self.request("PUT", lookup_endpoint, data=payload)
+        elif lookup_status == 404:
+            create_endpoint = f"/JSSResource/{resource}/id/0"
+            status, body = await self.request("POST", create_endpoint, data=payload)
+        else:
+            LOG.error(
+                "Unable to determine whether %s '%s' exists: HTTP %s",
+                resource,
+                name,
+                lookup_status,
+            )
+            return lookup_status
+
+        if status not in SUCCESS_STATUSES and body:
+            LOG.error("Jamf response for %s '%s': %s", resource, name, body)
+        return status
+
+    def _selected_directories(
+        self,
+        root: Path,
+        changed_names: Sequence[str],
+        object_label: str,
+    ) -> list[str]:
+        if self.ctx.args.update_all:
+            LOG.info("Copying all %s", object_label)
+            return sorted(path.name for path in root.iterdir() if path.is_dir())
+
+        if not changed_names:
+            return []
+
+        changed_set = set(changed_names)
+        return sorted(
+            path.name
+            for path in root.iterdir()
+            if path.is_dir() and path.name in changed_set
+        )
+
+    @staticmethod
+    def _first_file_with_extensions(
+        directory: Path,
+        extensions: set[str],
+    ) -> Path | None:
+        matches = sorted(
+            path
+            for path in directory.iterdir()
+            if path.is_file() and path.suffix.lower().lstrip(".") in extensions
+        )
+        return matches[0] if matches else None
+
+    @staticmethod
+    def _ensure_name(template, fallback_name: str) -> str:
+        name_element = template.find("name")
+        if name_element is None:
+            name_element = eTree.SubElement(template, "name")
+        if not name_element.text:
+            name_element.text = fallback_name
+        return name_element.text
+
+    def _normalize_category(self, template, add_none: bool) -> None:
+        category = template.find("category")
+        if category is None or not category.text:
+            return
+        if category.text in self.ctx.categories:
+            return
+
+        invalid_category = category.text
+        template.remove(category)
+        if add_none:
+            eTree.SubElement(template, "category").text = "None"
+
+        LOG.warning(
+            'Category "%s" does not exist in Jamf; using %s',
+            invalid_category,
+            '"None"' if add_none else "no category",
+        )
+
+    def _log_xml(self, template) -> None:
+        if self.ctx.args.verbose:
+            LOG.debug("Template XML: %s", eTree.tostring(template, encoding="unicode"))
+
+    @staticmethod
+    def _log_upload_result(object_type: str, name: str, status: int) -> None:
+        if status in SUCCESS_STATUSES:
+            LOG.info("Uploaded %s: %s", object_type, name)
+        else:
+            LOG.error("Error uploading %s '%s': HTTP %s", object_type, name, status)
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Sync repository with Jamf Pro")
     parser.add_argument("--url")
     parser.add_argument("--username")
     parser.add_argument("--password")
@@ -85,646 +422,220 @@ def parse_arguments():
     )
     parser.add_argument("--update_all", action="store_true")
     parser.add_argument("--jenkins", action="store_true")
-
     return parser.parse_args()
 
 
-def find_config_file():
-    """Return the first available Jamf API configuration file."""
+def find_config_file() -> Path | None:
     config_locations = (
-        "jamfapi.cfg",
-        os.path.expanduser("~/jamfapi.cfg"),
+        Path("jamfapi.cfg"),
+        Path.home() / "jamfapi.cfg",
     )
 
     for config_path in config_locations:
-        if os.path.isfile(config_path):
+        if config_path.is_file():
             LOG.info("Found configuration file: %s", config_path)
             return config_path
-
     return None
 
 
-def read_config_file(config_path):
-    """Read Jamf settings from a configuration file."""
-    settings = {
+def read_config_file(config_path: Path | None) -> dict[str, str | None]:
+    settings: dict[str, str | None] = {
         "username": None,
         "password": None,
         "url": None,
         "sync_path": None,
     }
-
-    if not config_path:
+    if config_path is None:
         return settings
 
     config = configparser.ConfigParser()
     config.read(config_path)
-
     if not config.has_section("jss"):
-        LOG.warning(
-            "Configuration file %s does not contain a [jss] section",
-            config_path,
-        )
+        LOG.warning("Configuration file %s has no [jss] section", config_path)
         return settings
 
     settings["username"] = config.get("jss", "username", fallback=None)
     settings["password"] = config.get("jss", "password", fallback=None)
     settings["url"] = config.get("jss", "server", fallback=None)
     settings["sync_path"] = config.get("jss", "sync_path", fallback=None)
-
     return settings
 
 
 def first_value(*values):
-    """Return the first value that is not None or empty."""
-    for value in values:
-        if value is not None and value != "":
-            return value
-
-    return None
+    return next((value for value in values if value not in (None, "")), None)
 
 
-def resolve_settings(parsed_args):
-    """
-    Resolve settings using this precedence:
+def resolve_settings(args: argparse.Namespace) -> AppSettings:
+    config = read_config_file(find_config_file())
 
-    1. Command-line arguments
-    2. Environment variables
-    3. jamfapi.cfg
-    4. Built-in defaults
-    """
-    config_path = find_config_file()
-    config = read_config_file(config_path)
+    username = first_value(args.username, os.getenv("JAMF_API_USER"), config["username"])
+    password = first_value(args.password, os.getenv("JAMF_API_PASS"), config["password"])
+    url = first_value(args.url, os.getenv("MDM_URL"), config["url"])
+    sync_path_value = first_value(
+        args.sync_path,
+        config["sync_path"],
+        str(Path(__file__).resolve().parent),
+    )
 
-    settings = {
-        "username": first_value(
-            parsed_args.username,
-            os.getenv("JAMF_API_USER"),
-            config["username"],
-        ),
-        "password": first_value(
-            parsed_args.password,
-            os.getenv("JAMF_API_PASS"),
-            config["password"],
-        ),
-        "url": first_value(
-            parsed_args.url,
-            os.getenv("MDM_URL"),
-            config["url"],
-        ),
-        "sync_path": first_value(
-            parsed_args.sync_path,
-            config["sync_path"],
-            dirname(realpath(__file__)),
-        ),
-    }
+    if not username:
+        raise ValueError("Missing required Jamf setting: username")
+    if not url:
+        raise ValueError("Missing required Jamf setting: url")
+    if not password:
+        password = getpass.getpass(f"Password for {username}: ")
 
-    if settings["url"]:
-        settings["url"] = settings["url"].rstrip("/")
-
-    if not settings["password"]:
-        settings["password"] = getpass.getpass(
-            f"Password for {settings['username'] or 'Jamf API user'}: "
-        )
-
+    settings = AppSettings(
+        url=str(url).rstrip("/"),
+        username=str(username),
+        password=str(password),
+        sync_path=Path(str(sync_path_value)).expanduser().resolve(),
+    )
     validate_settings(settings)
     return settings
 
 
-def validate_settings(settings):
-    """Validate required settings and repository directories."""
-    missing_settings = [
-        setting_name
-        for setting_name in ("url", "username", "password")
-        if not settings.get(setting_name)
+def validate_settings(settings: AppSettings) -> None:
+    if not settings.sync_path.is_dir():
+        raise ValueError(f"Sync path is not a directory: {settings.sync_path}")
+
+    required_directories = ("scripts", "extension_attributes", "templates")
+    missing = [
+        name
+        for name in required_directories
+        if not (settings.sync_path / name).is_dir()
     ]
-
-    if missing_settings:
-        missing = ", ".join(missing_settings)
-        raise ValueError(f"Missing required Jamf settings: {missing}")
-
-    sync_directory = settings["sync_path"]
-
-    if not os.path.isdir(sync_directory):
+    if missing:
         raise ValueError(
-            f"Sync path does not exist or is not a directory: {sync_directory}"
+            "Sync path is missing required directories: " + ", ".join(missing)
         )
 
-    required_directories = (
-        "scripts",
-        "extension_attributes",
-        "templates",
+
+def get_uapi_token(settings: AppSettings) -> str:
+    response = requests.post(
+        f"{settings.url}/api/v1/auth/token",
+        auth=(settings.username, settings.password),
+        timeout=10,
     )
-
-    missing_directories = [
-        directory
-        for directory in required_directories
-        if not os.path.isdir(join(sync_directory, directory))
-    ]
-
-    if missing_directories:
-        missing = ", ".join(missing_directories)
-        raise ValueError(
-            f"Sync path is missing required directories: {missing}"
-        )
+    response.raise_for_status()
+    response_json = response.json()
+    token = response_json.get("token")
+    if not token:
+        raise ValueError("Jamf token response did not contain a token")
+    return token
 
 
-def configure_debugging(parsed_args):
-    """Enable additional asyncio and resource debugging."""
-    if not parsed_args.verbose:
-        return
-
-    warnings.simplefilter("always", ResourceWarning)
-
-def check_for_changes():
-    """Looks for files that were changed between the current commit and
-    the last commit so we don't upload everything on every run
-      --jenkins will utilize $GIT_PREVIOUS_COMMIT and $GIT_COMMIT
-        environmental variables
-      --update_all can be invoked to upload all scripts and
-        extension attributes
-    """
-    # This line will work with the environmental variables in Jenkins
-    if args.jenkins:
-        git_changes = (
-            os.popen("git diff --name-only $GIT_PREVIOUS_COMMIT $GIT_COMMIT")
-            .read()
-            .split("\n")
-        )
-
-    # Compare the last two commits to determine the list of files that
-    # were changed
-    else:
-        git_commits = (
-            os.popen('git log -2 --pretty=oneline --pretty=format:"%h"')
-            .read()
-            .split("\n")
-        )
-        command = "git diff --name-only" + " " + git_commits[1] + " " + git_commits[0]
-        git_changes = os.popen(command).read().split("\n")
-
-    for i in git_changes:
-        if "extension_attributes/" in i and i.split("/")[1] not in changed_ext_attrs:
-            changed_ext_attrs.append(i.split("/")[1])
-
-    for i in git_changes:
-        if "scripts/" in i and i.split("/")[1] not in changed_scripts:
-            changed_scripts.append(i.split("/")[1])
-
-
-def write_jenkins_file():
-    """Write changed_ext_attrs and changed_scripts to jenkins file.
-    $eas will contains the changed extension attributes,
-    $scripts will contains the changed scripts
-    If there are no changes, the variable will be set to 'None'
-    """
-
-    if not changed_ext_attrs:
-        contents = "eas=" + "None"
-    else:
-        contents = "eas=" + SLACK_EMOJI + changed_ext_attrs[0] + "\\n" + "\\"
-        for changed_ext_attr in changed_ext_attrs[1:]:
-            contents = contents + "\n" + SLACK_EMOJI + changed_ext_attr + "\\n" + "\\"
-
-    if not changed_scripts:
-        contents = contents.rstrip("\\") + "\n" + "scripts=" + "None"
-
-    else:
-        contents = (
-            contents.rstrip("\\")
-            + "\n"
-            + "scripts="
-            + SLACK_EMOJI
-            + changed_scripts[0]
-            + "\\n"
-            + "\\"
-        )
-        for changed_script in changed_scripts[1:]:
-            contents = contents + "\n" + SLACK_EMOJI + changed_script + "\\n" + "\\"
-
-    with open("jenkins.properties", "w") as f:
-        f.write(contents)
-
-
-async def upload_extension_attributes(session, url, user, passwd, semaphore):
-    # sync_path = dirname(realpath(__file__))
-    if not changed_ext_attrs and not args.update_all:
-        print("No Changes in Extension Attributes")
-        return
-    ext_attrs = [
-        f.name
-        for f in os.scandir(join(sync_path, "extension_attributes"))
-        if f.is_dir() and f.name in changed_ext_attrs
-    ]
-    if args.update_all:
-        print("Copying all extension attributes...")
-        ext_attrs = [
-            f.name
-            for f in os.scandir(join(sync_path, "extension_attributes"))
-            if f.is_dir()
-        ]
-    tasks = []
-    for ea in ext_attrs:
-        task = asyncio.ensure_future(
-            upload_extension_attribute(session, url, user, passwd, ea, semaphore)
-        )
-        tasks.append(task)
-    await asyncio.gather(*tasks)
-
-
-async def upload_extension_attribute(session, url, user, passwd, ext_attr, semaphore):
-    has_script = True
-
-    # sync_path = dirname(realpath(__file__))
-    # auth = aiohttp.BasicAuth(user, passwd)
-    headers = {
-        "Accept": "application/xml",
-        "Content-Type": "application/xml",
-        "Authorization": "Bearer " + token,
-    }
-    # Get the script files within the folder, we'll only use
-    # script_file[0] in case there are multiple files
-    script_file = [
-        f.name
-        for f in os.scandir(join(sync_path, "extension_attributes", ext_attr))
-        if f.is_file() and f.name.split(".")[-1] in SUPPORTED_EA_EXTENSIONS
-    ]
-    if script_file == []:
-        print("Warning: No script file found in extension_attributes/%s" % ext_attr)
-        has_script = False
-        # return  # Need to skip if no script.
-    if has_script:
-        with open(
-            join(sync_path, "extension_attributes", ext_attr, script_file[0]), "r"
-        ) as f:
-            data = f.read()
-    async with semaphore:
-        with async_timeout.timeout(args.timeout):
-            template = await get_ea_template(session, url, user, passwd, ext_attr)
-            async with session.get(
-                url
-                + "/JSSResource/computerextensionattributes/name/"
-                + template.find("name").text,
-                headers=headers,
-            ) as resp:
-                if has_script and data:
-                    template.find("input_type/script").text = data
-                if args.verbose:
-                    print(eTree.tostring(template))
-                    print("response status initial get: ", resp.status)
-                if resp.status == 200:
-                    put_url = (
-                        url
-                        + "/JSSResource/computerextensionattributes/name/"
-                        + template.find("name").text
-                    )
-                    resp = await session.put(
-                        put_url, data=eTree.tostring(template), headers=headers
-                    )
-                else:
-                    post_url = url + "/JSSResource/computerextensionattributes/id/0"
-                    resp = await session.post(
-                        post_url, data=eTree.tostring(template), headers=headers
-                    )
-    if args.verbose:
-        print("response status: ", resp.status)
-        print("EA: ", ext_attr)
-        print("EA Name: ", template.find("name").text)
-    if resp.status in (201, 200):
-        print("Uploaded Extension Attribute: %s" % template.find("name").text)
-    else:
-        print("Error uploading script: %s" % template.find("name").text)
-        print("Error: %s" % resp.status)
-    return resp.status
-
-
-async def get_ea_template(session, url, user, passwd, ext_attr):
-    # auth = aiohttp.BasicAuth(user, passwd)
-    # sync_path = dirname(realpath(__file__))
-    xml_file = [
-        f.name
-        for f in os.scandir(join(sync_path, "extension_attributes", ext_attr))
-        if f.is_file() and f.name.split(".")[-1] in "xml"
-    ]
-    try:
-        with open(
-            join(sync_path, "extension_attributes", ext_attr, xml_file[0]), "r"
-        ) as file:
-            template = eTree.parse(file.read())
-    except IndexError:
-        with async_timeout.timeout(args.timeout):
-            headers = {
-                "Accept": "application/xml",
-                "Content-Type": "application/xml",
-                "Authorization": "Bearer " + token,
-            }
-
-            async with session.get(
-                url + "/JSSResource/computerextensionattributes/name/" + ext_attr,
-                headers=headers,
-            ) as resp:
-                if resp.status == 200:
-                    async with session.get(
-                        url
-                        + "/JSSResource/computerextensionattributes/name/"
-                        + ext_attr,
-                        headers=headers,
-                    ) as response:
-                        template = eTree.fromstring(await response.text())
-                else:
-                    template = eTree.parse(
-                        join(sync_path, "templates/ea.xml")
-                    ).getroot()
-    # name is mandatory, so we use the foldername if nothing is set in
-    # a template
-    if args.verbose:
-        print(eTree.tostring(template))
-    if template.find("category") and template.find("category").text not in CATEGORIES:
-        eTree.SubElement(template, "category").text = "None"
-        if args.verbose:
-            c = template.find("category").text
-            print(
-                f"""WARNING: Unable to find category {c} in the JSS,
-                  setting to None"""
-            )
-    if template.find("name") is None:
-        eTree.SubElement(template, "name").text = ext_attr
-    elif not template.find("name").text or template.find("name").text is None:
-        template.find("name").text = ext_attr
-    return template
-
-
-async def upload_scripts(session, url, user, passwd, semaphore):
-    # sync_path = dirname(realpath(__file__))
-
-    if not changed_scripts and not args.update_all:
-        print("No Changes in Scripts")
-    scripts = [
-        f.name
-        for f in os.scandir(join(sync_path, "scripts"))
-        if f.is_dir() and f.name in changed_scripts
-    ]
-    if args.update_all:
-        print("Copying all scripts...")
-        scripts = [f.name for f in os.scandir(join(sync_path, "scripts")) if f.is_dir()]
-
-    tasks = []
-    for script in scripts:
-        task = asyncio.ensure_future(
-            upload_script(session, url, user, passwd, script, semaphore)
-        )
-        tasks.append(task)
-    await asyncio.gather(*tasks)
-
-
-async def upload_script(session, url, user, passwd, script, semaphore):
-    # sync_path = dirname(realpath(__file__))
-    # auth = aiohttp.BasicAuth(user, passwd)
-    headers = {
-        "Accept": "application/xml",
-        "Content-Type": "application/xml",
-        "Authorization": "Bearer " + token,
-    }
-    script_file = [
-        f.name
-        for f in os.scandir(join(sync_path, "scripts", script))
-        if f.is_file() and f.name.split(".")[-1] in SUPPORTED_SCRIPT_EXTENSIONS
-    ]
-    if script_file == []:
-        print("Warning: No script file found in scripts/%s" % script)
-        return  # Need to skip if no script.
-    with open(join(sync_path, "scripts", script, script_file[0]), "r") as f:
-        data = f.read()
-    async with semaphore:
-        with async_timeout.timeout(args.timeout):
-            template = await get_script_template(session, url, user, passwd, script)
-            async with session.get(
-                url + "/JSSResource/scripts/name/" + template.find("name").text,
-                headers=headers,
-            ) as resp:
-                template.find("script_contents").text = data
-                if resp.status == 200:
-                    put_url = (
-                        url + "/JSSResource/scripts/name/" + template.find("name").text
-                    )
-                    resp = await session.put(
-                        put_url, data=eTree.tostring(template), headers=headers
-                    )
-                else:
-                    post_url = url + "/JSSResource/scripts/id/0"
-                    resp = await session.post(
-                        post_url, data=eTree.tostring(template), headers=headers
-                    )
-    if resp.status in (201, 200):
-        print("Uploaded script: %s" % template.find("name").text)
-    else:
-        print("Error uploading script: %s" % template.find("name").text)
-        print("Error: %s" % resp.status)
-    return resp.status
-
-
-async def get_script_template(session, url, user, passwd, script):
-    # auth = aiohttp.BasicAuth(user, passwd)
-    # sync_path = dirname(realpath(__file__))
-    xml_file = [
-        f.name
-        for f in os.scandir(join(sync_path, "scripts", script))
-        if f.is_file() and f.name.split(".")[-1] in "xml"
-    ]
-    try:
-        with open(join(sync_path, "scripts", script, xml_file[0]), "r") as file:
-            template = eTree.fromstring(file.read())
-    except IndexError:
-        with async_timeout.timeout(args.timeout):
-            headers = {
-                "Accept": "application/xml",
-                "Content-Type": "application/xml",
-                "Authorization": "Bearer " + token,
-            }
-            async with session.get(
-                url + "/JSSResource/scripts/name/" + script, headers=headers
-            ) as resp:
-                if resp.status == 200:
-                    async with session.get(
-                        url + "/JSSResource/scripts/name/" + script, headers=headers
-                    ) as response:
-                        template = eTree.fromstring(await response.text())
-                else:
-                    template = eTree.parse(
-                        join(sync_path, "templates/script.xml")
-                    ).getroot()
-    # name is mandatory, so we use the filename if nothing is set in a template
-    if args.verbose:
-        print(eTree.tostring(template))
-    if (
-        template.find("category") is not None
-        and template.find("category").text not in CATEGORIES
-    ):
-        c = template.find("category").text
-        template.remove(template.find("category"))
-        if args.verbose:
-            print(
-                f"""WARNING: Unable to find category "{c}" in the JSS,
-                    setting to None"""
-            )
-    if template.find("name") is None:
-        eTree.SubElement(template, "name").text = script
-    elif not template.find("name").text or template.find("name").text is None:
-        template.find("name").text = script
-    return template
-
-
-async def get_existing_categories(session, url, user, passwd, semaphore):
-    # auth = aiohttp.BasicAuth(user, passwd)
-    headers = {
-        "Accept": "application/xml",
-        "Content-Type": "application/xml",
-        "Authorization": "Bearer " + token,
-    }
-    async with semaphore:
-        with async_timeout.timeout(args.timeout):
-            async with session.get(
-                url + "/JSSResource/categories", headers=headers
-            ) as resp:
-                if resp.status in (201, 200):
-                    return [
-                        c.find("name").text
-                        for c in [
-                            e
-                            for e in eTree.fromstring(await resp.text()).findall(
-                                "category"
-                            )
-                        ]
-                    ]
-    return []
-
-
-async def async_main(
-    jamf_url,
-    username,
-    password,
-    bearer_token,
-    parsed_args,
-):
-    """Run the Jamf synchronization tasks."""
-    global CATEGORIES
-
-    semaphore = asyncio.BoundedSemaphore(parsed_args.limit)
-
-    headers = {
-        "Accept": "application/xml",
-        "Content-Type": "application/xml",
-        "Authorization": f"Bearer {bearer_token}",
-    }
-
-    connector = aiohttp.TCPConnector(
-        ssl=False if parsed_args.do_not_verify_ssl else None
+def invalidate_uapi_token(settings: AppSettings, token: str) -> None:
+    response = requests.post(
+        f"{settings.url}/api/v1/auth/invalidate-token",
+        headers={"Accept": "*/*", "Authorization": f"Bearer {token}"},
+        timeout=10,
     )
+    if response.status_code not in (200, 204):
+        LOG.warning("Unable to invalidate Jamf token: HTTP %s", response.status_code)
 
-    timeout = aiohttp.ClientTimeout(total=parsed_args.timeout)
 
-    async with aiohttp.ClientSession(
-        connector=connector,
-        timeout=timeout,
-        headers=headers,
-    ) as session:
-        CATEGORIES = await get_existing_categories(
-            session,
-            jamf_url,
-            username,
-            password,
-            semaphore,
+def git_changed_files(jenkins: bool) -> list[str]:
+    if jenkins:
+        previous_commit = os.getenv("GIT_PREVIOUS_COMMIT")
+        current_commit = os.getenv("GIT_COMMIT")
+        if not previous_commit or not current_commit:
+            raise ValueError(
+                "Jenkins mode requires GIT_PREVIOUS_COMMIT and GIT_COMMIT"
+            )
+        command = ["git", "diff", "--name-only", previous_commit, current_commit]
+    else:
+        result = subprocess.run(
+            ["git", "log", "-2", "--pretty=format:%H"],
+            check=True,
+            capture_output=True,
+            text=True,
         )
+        commits = [line for line in result.stdout.splitlines() if line]
+        if len(commits) < 2:
+            LOG.warning("Fewer than two Git commits found; no changed files selected")
+            return []
+        command = ["git", "diff", "--name-only", commits[1], commits[0]]
 
-        LOG.debug("Found %d Jamf categories", len(CATEGORIES))
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
-        await asyncio.gather(
-            upload_scripts(
-                session,
-                jamf_url,
-                username,
-                password,
-                semaphore,
-            ),
-            upload_extension_attributes(
-                session,
-                jamf_url,
-                username,
-                password,
-                semaphore,
-            ),
-        )
 
-def run():
-    """Initialize configuration and run the synchronization."""
-    global args
-    global changed_ext_attrs
-    global changed_scripts
-    global sync_path
-    global username
-    global password
-    global url
-    global token
+def check_for_changes(ctx: RuntimeContext) -> None:
+    for changed_path in git_changed_files(ctx.args.jenkins):
+        parts = Path(changed_path).parts
+        if len(parts) < 2:
+            continue
 
+        if parts[0] == "extension_attributes":
+            if parts[1] not in ctx.changed_ext_attrs:
+                ctx.changed_ext_attrs.append(parts[1])
+        elif parts[0] == "scripts":
+            if parts[1] not in ctx.changed_scripts:
+                ctx.changed_scripts.append(parts[1])
+
+
+def format_jenkins_value(items: Sequence[str]) -> str:
+    if not items:
+        return "None"
+    return "\\n\\\n".join(f"{SLACK_EMOJI}{item}" for item in items) + "\\n"
+
+
+def write_jenkins_file(ctx: RuntimeContext) -> None:
+    contents = (
+        f"eas={format_jenkins_value(ctx.changed_ext_attrs)}\n"
+        f"scripts={format_jenkins_value(ctx.changed_scripts)}"
+    )
+    Path("jenkins.properties").write_text(contents, encoding="utf-8")
+
+
+def configure_runtime(args: argparse.Namespace) -> None:
+    if args.verbose:
+        warnings.simplefilter("always", ResourceWarning)
+
+
+def run() -> None:
     args = parse_arguments()
-    configure_debugging(args)
-
+    configure_runtime(args)
     settings = resolve_settings(args)
+    ctx = RuntimeContext(args=args, settings=settings)
 
-    username = settings["username"]
-    password = settings["password"]
-    url = settings["url"]
-    sync_path = settings["sync_path"]
-
-    changed_ext_attrs = []
-    changed_scripts = []
-
-    check_for_changes()
-
-    LOG.info(
-        "Changed Extension Attributes: %s",
-        changed_ext_attrs or "None",
-    )
-    LOG.info(
-        "Changed Scripts: %s",
-        changed_scripts or "None",
-    )
+    check_for_changes(ctx)
+    LOG.info("Changed Extension Attributes: %s", ctx.changed_ext_attrs or "None")
+    LOG.info("Changed Scripts: %s", ctx.changed_scripts or "None")
 
     if args.jenkins:
-        write_jenkins_file()
-
-    token = None
+        write_jenkins_file(ctx)
 
     try:
-        token = get_uapi_token(
-            jamf_url=url,
-            username=username,
-            password=password,
-        )
-
-        asyncio.run(
-            async_main(
-                jamf_url=url,
-                username=username,
-                password=password,
-                bearer_token=token,
-                parsed_args=args,
-            ),
-            debug=args.verbose,
-        )
+        ctx.token = get_uapi_token(settings)
+        asyncio.run(JamfSync(ctx).run(), debug=args.verbose)
     finally:
-        if token:
-            invalidate_uapi_token(url, token)
+        if ctx.token:
+            invalidate_uapi_token(settings, ctx.token)
 
 
 if __name__ == "__main__":
-    uvloop.install()
+    if uvloop is not None:
+        uvloop.install()
 
     try:
         run()
     except KeyboardInterrupt:
         LOG.warning("Synchronization interrupted by user")
         sys.exit(130)
-    except (ValueError, requests.RequestException) as error:
+    except (
+        ValueError,
+        FileNotFoundError,
+        requests.RequestException,
+        aiohttp.ClientError,
+        subprocess.CalledProcessError,
+        RuntimeError,
+    ) as error:
         LOG.error("%s", error)
         sys.exit(1)
     except Exception:
