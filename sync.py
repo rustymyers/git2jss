@@ -32,25 +32,208 @@ SUPPORTED_EA_EXTENSIONS = ("sh", "py", "pl", "swift", "rb")
 CATEGORIES = []
 
 
-# https://github.com/lazymutt/Jamf-Pro-API-Sampler/blob/5f8efa92911271248f527e70bd682db79bc600f2/jamf_duplicate_detection.py#L99
-def get_uapi_token():
-    """
-    fetches api token
-    """
-    jamf_test_url = url + "/api/v1/auth/token"
-    response = requests.post(url=jamf_test_url, auth=(username, password), timeout=5)
+def get_uapi_token(jamf_url, username, password):
+    """Request a Jamf Pro bearer token."""
+    token_url = f"{jamf_url}/api/v1/auth/token"
+
+    response = requests.post(
+        url=token_url,
+        auth=(username, password),
+        timeout=10,
+    )
+    response.raise_for_status()
+
     response_json = response.json()
     return response_json["token"]
 
 
-def invalidate_uapi_token(uapi_token):
-    """
-    invalidates api token
-    """
-    jamf_test_url = url + "/api/v1/auth/invalidate-token"
-    headers = {"Accept": "*/*", "Authorization": "Bearer " + uapi_token}
-    _ = requests.post(url=jamf_test_url, headers=headers, timeout=5)
+def invalidate_uapi_token(jamf_url, uapi_token):
+    """Invalidate a Jamf Pro bearer token."""
+    invalidate_url = f"{jamf_url}/api/v1/auth/invalidate-token"
+    headers = {
+        "Accept": "*/*",
+        "Authorization": f"Bearer {uapi_token}",
+    }
 
+    response = requests.post(
+        url=invalidate_url,
+        headers=headers,
+        timeout=10,
+    )
+
+    if response.status_code not in (200, 204):
+        LOG.warning(
+            "Unable to invalidate Jamf token. HTTP status: %s",
+            response.status_code,
+        )
+
+def parse_arguments():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Sync repository with Jamf Pro")
+
+    parser.add_argument("--url")
+    parser.add_argument("--username")
+    parser.add_argument("--password")
+    parser.add_argument("--sync_path")
+    parser.add_argument("--limit", type=int, default=25)
+    parser.add_argument("--timeout", type=int, default=60)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--do_not_verify_ssl",
+        action="store_true",
+        help="Disable SSL certificate verification",
+    )
+    parser.add_argument("--update_all", action="store_true")
+    parser.add_argument("--jenkins", action="store_true")
+
+    return parser.parse_args()
+
+
+def find_config_file():
+    """Return the first available Jamf API configuration file."""
+    config_locations = (
+        "jamfapi.cfg",
+        os.path.expanduser("~/jamfapi.cfg"),
+    )
+
+    for config_path in config_locations:
+        if os.path.isfile(config_path):
+            LOG.info("Found configuration file: %s", config_path)
+            return config_path
+
+    return None
+
+
+def read_config_file(config_path):
+    """Read Jamf settings from a configuration file."""
+    settings = {
+        "username": None,
+        "password": None,
+        "url": None,
+        "sync_path": None,
+    }
+
+    if not config_path:
+        return settings
+
+    config = configparser.ConfigParser()
+    config.read(config_path)
+
+    if not config.has_section("jss"):
+        LOG.warning(
+            "Configuration file %s does not contain a [jss] section",
+            config_path,
+        )
+        return settings
+
+    settings["username"] = config.get("jss", "username", fallback=None)
+    settings["password"] = config.get("jss", "password", fallback=None)
+    settings["url"] = config.get("jss", "server", fallback=None)
+    settings["sync_path"] = config.get("jss", "sync_path", fallback=None)
+
+    return settings
+
+
+def first_value(*values):
+    """Return the first value that is not None or empty."""
+    for value in values:
+        if value is not None and value != "":
+            return value
+
+    return None
+
+
+def resolve_settings(parsed_args):
+    """
+    Resolve settings using this precedence:
+
+    1. Command-line arguments
+    2. Environment variables
+    3. jamfapi.cfg
+    4. Built-in defaults
+    """
+    config_path = find_config_file()
+    config = read_config_file(config_path)
+
+    settings = {
+        "username": first_value(
+            parsed_args.username,
+            os.getenv("JAMF_API_USER"),
+            config["username"],
+        ),
+        "password": first_value(
+            parsed_args.password,
+            os.getenv("JAMF_API_PASS"),
+            config["password"],
+        ),
+        "url": first_value(
+            parsed_args.url,
+            os.getenv("MDM_URL"),
+            config["url"],
+        ),
+        "sync_path": first_value(
+            parsed_args.sync_path,
+            config["sync_path"],
+            dirname(realpath(__file__)),
+        ),
+    }
+
+    if settings["url"]:
+        settings["url"] = settings["url"].rstrip("/")
+
+    if not settings["password"]:
+        settings["password"] = getpass.getpass(
+            f"Password for {settings['username'] or 'Jamf API user'}: "
+        )
+
+    validate_settings(settings)
+    return settings
+
+
+def validate_settings(settings):
+    """Validate required settings and repository directories."""
+    missing_settings = [
+        setting_name
+        for setting_name in ("url", "username", "password")
+        if not settings.get(setting_name)
+    ]
+
+    if missing_settings:
+        missing = ", ".join(missing_settings)
+        raise ValueError(f"Missing required Jamf settings: {missing}")
+
+    sync_directory = settings["sync_path"]
+
+    if not os.path.isdir(sync_directory):
+        raise ValueError(
+            f"Sync path does not exist or is not a directory: {sync_directory}"
+        )
+
+    required_directories = (
+        "scripts",
+        "extension_attributes",
+        "templates",
+    )
+
+    missing_directories = [
+        directory
+        for directory in required_directories
+        if not os.path.isdir(join(sync_directory, directory))
+    ]
+
+    if missing_directories:
+        missing = ", ".join(missing_directories)
+        raise ValueError(
+            f"Sync path is missing required directories: {missing}"
+        )
+
+
+def configure_debugging(parsed_args):
+    """Enable additional asyncio and resource debugging."""
+    if not parsed_args.verbose:
+        return
+
+    warnings.simplefilter("always", ResourceWarning)
 
 def check_for_changes():
     """Looks for files that were changed between the current commit and
@@ -415,105 +598,135 @@ async def get_existing_categories(session, url, user, passwd, semaphore):
     return []
 
 
-async def main():
-    # pylint: disable=global-statement
+async def async_main(
+    jamf_url,
+    username,
+    password,
+    bearer_token,
+    parsed_args,
+):
+    """Run the Jamf synchronization tasks."""
     global CATEGORIES
-    semaphore = asyncio.BoundedSemaphore(args.limit)
-    async with aiohttp.ClientSession() as session:
-        async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=args.do_not_verify_ssl)
-        ) as session:
-            CATEGORIES = await get_existing_categories(
-                session, url, username, password, semaphore
-            )
-            await upload_scripts(session, url, username, password, semaphore)
-            await upload_extension_attributes(
-                session, url, username, password, semaphore
-            )
 
+    semaphore = asyncio.BoundedSemaphore(parsed_args.limit)
 
-if __name__ == "__main__":
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    headers = {
+        "Accept": "application/xml",
+        "Content-Type": "application/xml",
+        "Authorization": f"Bearer {bearer_token}",
+    }
 
-    # Export to current directory by default
-    sync_path = dirname(realpath(__file__))
+    connector = aiohttp.TCPConnector(
+        ssl=False if parsed_args.do_not_verify_ssl else None
+    )
 
-    parser = argparse.ArgumentParser(description="Sync repo with JamfPro")
-    parser.add_argument("--url")
-    parser.add_argument("--username")
-    parser.add_argument("--password")
-    parser.add_argument("--sync_path")
-    parser.add_argument("--limit", type=int, default=25)
-    parser.add_argument("--timeout", type=int, default=60)
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--do_not_verify_ssl", action="store_false")
-    parser.add_argument("--update_all", action="store_true")
-    parser.add_argument("--jenkins", action="store_true")
-    args = parser.parse_args()
+    timeout = aiohttp.ClientTimeout(total=parsed_args.timeout)
+
+    async with aiohttp.ClientSession(
+        connector=connector,
+        timeout=timeout,
+        headers=headers,
+    ) as session:
+        CATEGORIES = await get_existing_categories(
+            session,
+            jamf_url,
+            username,
+            password,
+            semaphore,
+        )
+
+        LOG.debug("Found %d Jamf categories", len(CATEGORIES))
+
+        await asyncio.gather(
+            upload_scripts(
+                session,
+                jamf_url,
+                username,
+                password,
+                semaphore,
+            ),
+            upload_extension_attributes(
+                session,
+                jamf_url,
+                username,
+                password,
+                semaphore,
+            ),
+        )
+
+def run():
+    """Initialize configuration and run the synchronization."""
+    global args
+    global changed_ext_attrs
+    global changed_scripts
+    global sync_path
+    global username
+    global password
+    global url
+    global token
+
+    args = parse_arguments()
+    configure_debugging(args)
+
+    settings = resolve_settings(args)
+
+    username = settings["username"]
+    password = settings["password"]
+    url = settings["url"]
+    sync_path = settings["sync_path"]
 
     changed_ext_attrs = []
     changed_scripts = []
+
     check_for_changes()
-    print("Changed Extension Attributes: ", changed_ext_attrs)
-    print("Changed Scripts: ", changed_scripts)
+
+    LOG.info(
+        "Changed Extension Attributes: %s",
+        changed_ext_attrs or "None",
+    )
+    LOG.info(
+        "Changed Scripts: %s",
+        changed_scripts or "None",
+    )
 
     if args.jenkins:
         write_jenkins_file()
-    # Set configs file locations
-    CONFIG_FILE_LOCATIONS = ["jamfapi.cfg", os.path.expanduser("~/jamfapi.cfg")]
-    CONFIG_FILE = ""
-    # Parse Config File
-    CONFPARSER = configparser.ConfigParser()
-    for config_path in CONFIG_FILE_LOCATIONS:
-        if os.path.exists(config_path):
-            print("Found Config: {0}".format(config_path))
-            CONFIG_FILE = config_path
 
-    if CONFIG_FILE != "":
-        # Get config
-        CONFPARSER.read(CONFIG_FILE)
-        try:
-            username = CONFPARSER.get("jss", "username")
-        except configparser.NoOptionError:
-            print("Can't find username in configfile")
-        try:
-            password = CONFPARSER.get("jss", "password")
-        except configparser.NoOptionError:
-            print("Can't find password in configfile")
-        try:
-            url = CONFPARSER.get("jss", "server")
-        except configparser.NoOptionError:
-            print("Can't find url in configfile")
-        try:
-            sync_path = CONFPARSER.get("jss", "sync_path")
-        except configparser.NoOptionError:
-            print("Can't find sync_path in config")
+    token = None
 
-    # Ask for password if not supplied via command line args
-    if args.password:
-        password = args.password
-    elif password is None:
-        password = getpass.getpass()
+    try:
+        token = get_uapi_token(
+            jamf_url=url,
+            username=username,
+            password=password,
+        )
 
-    if args.sync_path:
-        sync_path = args.sync_path
+        asyncio.run(
+            async_main(
+                jamf_url=url,
+                username=username,
+                password=password,
+                bearer_token=token,
+                parsed_args=args,
+            ),
+            debug=args.verbose,
+        )
+    finally:
+        if token:
+            invalidate_uapi_token(url, token)
 
-    if args.url:
-        url = args.url
 
-    if args.username:
-        username = args.username
+if __name__ == "__main__":
+    uvloop.install()
 
-    token = get_uapi_token()
-
-    loop = asyncio.get_event_loop()
-
-    if args.verbose:
-        loop.set_debug(True)
-        loop.slow_callback_duration = 0.001
-        warnings.simplefilter("always", ResourceWarning)
-
-    loop.run_until_complete(main())
-
-    # Remove token
-    invalidate_uapi_token(token)
+    try:
+        run()
+    except KeyboardInterrupt:
+        LOG.warning("Synchronization interrupted by user")
+        sys.exit(130)
+    except (ValueError, requests.RequestException) as error:
+        LOG.error("%s", error)
+        sys.exit(1)
+    except Exception:
+        LOG.exception("Unexpected synchronization failure")
+        sys.exit(1)
