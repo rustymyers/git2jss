@@ -441,7 +441,6 @@ def find_config_file() -> Path | None:
 def read_config_file(config_path: Path | None) -> dict[str, str | None]:
     settings: dict[str, str | None] = {
         "username": None,
-        "password": None,
         "url": None,
         "sync_path": None,
     }
