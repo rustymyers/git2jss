@@ -28,47 +28,15 @@ def invalidate_uapi_token(uapi_token):
     _ = requests.post(url=jamf_test_url, headers=headers, timeout=5)
 
 
-def download_scripts(
-    mode,
-    overwrite=None,
-):
-    """Downloads Scripts to ./scripts and Extension Attributes to ./extension_attributes
+RESOURCE_CONFIG = {
+    "ea": ("computerextensionattributes", "extension_attributes", "input_type/script"),
+    "script": ("scripts", "scripts", "script_contents"),
+}
 
-    Folder Structure:
-    ./scripts/script_name/script.sh
-    ./scripts/script_name/script.xml
-    ./extension_attributes/ea_name/ea.sh
-    ./extension_attributes/ea_name/ea.xml
 
-    Usage:
-
-    Download all Extension Attributes from JSS:
-    download_scripts('ea','overwrite=False)
-
-    Download all Extension Attributes from JSS:
-    download_scripts('script','overwrite=False)
-
-    Params:
-    mode = 'script' or 'ea'
-    overwrite = True/False
-    Returns: None
-    """
-
-    # Set various values based on resource type
-    if mode == "ea":
-        resource = "computerextensionattributes"
-        download_path = "extension_attributes"
-        script_xml = "input_type/script"
-
-    if mode == "script":
-        resource = "scripts"
-        download_path = "scripts"
-        script_xml = "script_contents"
-
-    token = get_uapi_token()
-    # Get all IDs of resource type
-    r = requests.get(
-        url + "/JSSResource/%s" % resource,
+def request_xml(endpoint, token):
+    response = requests.get(
+        url + endpoint,
         headers={
             "Accept": "application/xml",
             "Content-Type": "application/xml",
@@ -77,101 +45,107 @@ def download_scripts(
         verify=args.do_not_verify_ssl,
         timeout=5,
     )
+    response.raise_for_status()
+    return eTree.fromstring(response.content)
 
-    # Basic error handling
-    if r.status_code != 200:
+
+def get_resource_ids(resource, token):
+    try:
+        tree = request_xml("/JSSResource/%s" % resource, token)
+    except requests.HTTPError as error:
         print(
-            "Something went wrong with the request, check your password and privileges and try again. \n \
-        It's also possible that the url is incorrect. \n \
-        Here is the HTTP Status code: %s"
-            % r.status_code
+            "Something went wrong with the request, check your password and "
+            "privileges, URL, and HTTP status: %s" % error
         )
         exit(1)
-    tree = eTree.fromstring(r.content)
-    resource_ids = [e.text for e in tree.findall(".//id")]
+    return [element.text for element in tree.findall(".//id")]
 
-    # Download each resource and save to disk
-    for resource_id in resource_ids:
-        get_script = True
 
-        r = requests.get(
-            url + "/JSSResource/%s/id/%s" % (resource, resource_id),
-            headers={
-                "Accept": "application/xml",
-                "Content-Type": "application/xml",
-                "Authorization": "Bearer " + token,
-            },
-            verify=args.do_not_verify_ssl,
-            timeout=5,
+def script_extension(script, resource_name):
+    extensions = {
+        "#!/bin/sh": ".sh",
+        "#!/usr/bin/env sh": ".sh",
+        "#!/bin/bash": ".sh",
+        "#!/usr/bin/env bash": ".sh",
+        "#!/bin/zsh": ".sh",
+        "#!/usr/bin/python": ".py",
+        "#!/usr/bin/env python": ".py",
+        "#!/usr/bin/perl": ".pl",
+        "#!/usr/bin/ruby": ".rb",
+    }
+    for interpreter, extension in extensions.items():
+        if script.startswith(interpreter):
+            return extension
+    print("No interpreter directive found for: ", resource_name)
+    return ".sh"
+
+
+def prepare_resource(tree, mode, script_xml, resource_path):
+    script_node = tree.find(script_xml)
+    script = eTree.tostring(script_node, encoding="unicode", method="text").replace(
+        "\r", ""
+    )
+    extension = script_extension(script, tree.find("name").text)
+    with open(os.path.join(resource_path, "%s%s" % (mode, extension)), "w") as handle:
+        handle.write(script)
+
+    if script_node is not None:
+        script_node.clear()
+    for tag in ("id", "script_contents_encoded", "filename"):
+        node = tree.find(tag)
+        if node is not None:
+            tree.remove(node)
+
+
+def save_resource(tree, mode, script_xml, resource_path, get_script):
+    if get_script:
+        prepare_resource(tree, mode, script_xml, resource_path)
+    xml = minidom.parseString(
+        eTree.tostring(tree, encoding="unicode", method="xml")
+    ).toprettyxml(indent="   ")
+    with open(os.path.join(resource_path, "%s.xml" % mode), "w") as handle:
+        handle.write(xml)
+
+
+def download_resource(resource_id, mode, resource, download_path, script_xml, token, overwrite):
+    tree = request_xml("/JSSResource/%s/id/%s" % (resource, resource_id), token)
+    resource_name = tree.find("name").text
+    get_script = True
+    if mode == "ea" and tree.find("input_type/type").text != "script":
+        print("No script found in: %s" % resource_name)
+        get_script = False
+
+    resource_path = os.path.join(export_path, download_path, resource_name)
+    if os.path.exists(resource_path):
+        print("Resource is already in the repo: ", resource_name)
+        if not overwrite:
+            print("\tSkipping: ", resource_name)
+            return
+    else:
+        os.makedirs(resource_path)
+
+    print("Saving: ", resource_name)
+    save_resource(tree, mode, script_xml, resource_path, get_script)
+
+
+def download_scripts(mode, overwrite=None):
+    """Download scripts or script-based extension attributes from Jamf Pro."""
+    try:
+        resource, download_path, script_xml = RESOURCE_CONFIG[mode]
+    except KeyError:
+        raise ValueError("mode must be 'ea' or 'script'") from None
+
+    token = get_uapi_token()
+    for resource_id in get_resource_ids(resource, token):
+        download_resource(
+            resource_id,
+            mode,
+            resource,
+            download_path,
+            script_xml,
+            token,
+            overwrite,
         )
-        tree = eTree.fromstring(r.content)
-
-        if mode == "ea":
-            if tree.find("input_type/type").text != "script":
-                print("No script found in: %s" % tree.find("name").text)
-                get_script = False
-                # continue
-
-        # Determine resource path (folder name)
-        resource_path = os.path.join(export_path, download_path, tree.find("name").text)
-
-        # Check to see if it exists
-        if os.path.exists(resource_path):
-            print("Resource is already in the repo: ", tree.find("name").text)
-
-            if not overwrite:
-                print("\tSkipping: ", tree.find("name").text)
-                continue
-
-        else:  # Make the folder
-            os.makedirs(resource_path)
-
-        print("Saving: ", tree.find("name").text)
-
-        # Create script string, and determine the file extension
-        if get_script:
-            xmlstr = eTree.tostring(
-                tree.find(script_xml), encoding="unicode", method="text"
-            ).replace("\r", "")
-            if xmlstr.startswith("#!/bin/sh"):
-                ext = ".sh"
-            elif xmlstr.startswith("#!/usr/bin/env sh"):
-                ext = ".sh"
-            elif xmlstr.startswith("#!/bin/bash"):
-                ext = ".sh"
-            elif xmlstr.startswith("#!/usr/bin/env bash"):
-                ext = ".sh"
-            elif xmlstr.startswith("#!/bin/zsh"):
-                ext = ".sh"
-            elif xmlstr.startswith("#!/usr/bin/python"):
-                ext = ".py"
-            elif xmlstr.startswith("#!/usr/bin/env python"):
-                ext = ".py"
-            elif xmlstr.startswith("#!/usr/bin/perl"):
-                ext = ".pl"
-            elif xmlstr.startswith("#!/usr/bin/ruby"):
-                ext = ".rb"
-            else:
-                print("No interpreter directive found for: ", tree.find("name").text)
-                ext = ".sh"  # Call it sh for now so the uploader detects it
-
-            with open(os.path.join(resource_path, "%s%s" % (mode, ext)), "w") as f:
-                f.write(xmlstr)
-
-            # Need to remove ID and script contents and write out xml
-            try:
-                tree.find(script_xml).clear()
-                tree.remove(tree.find("id"))
-                tree.remove(tree.find("script_contents_encoded"))
-                tree.remove(tree.find("filename"))
-            except TypeError:
-                pass
-
-        xmlstr = minidom.parseString(
-            eTree.tostring(tree, encoding="unicode", method="xml")
-        ).toprettyxml(indent="   ")
-        with open(os.path.join(resource_path, "%s.xml" % mode), "w") as f:
-            f.write(xmlstr)
     invalidate_uapi_token(token)
 
 
@@ -179,7 +153,6 @@ if __name__ == "__main__":
     # Export to current directory by default
     export_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")
     username = None
-    password = ''
     url = None
 
     parser = argparse.ArgumentParser(description="Download Scripts from Jamf")
