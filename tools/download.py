@@ -179,7 +179,7 @@ if __name__ == "__main__":
     # Export to current directory by default
     export_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")
     username = None
-    password = None
+    password = ''
     url = None
 
     parser = argparse.ArgumentParser(description="Download Scripts from Jamf")
