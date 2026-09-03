@@ -1,9 +1,11 @@
 # git2jss
+
 [![Codacy Badge](https://app.codacy.com/project/badge/Grade/c49c0bd6a88d4f1e8c6808455171178e)](https://app.codacy.com/gh/rustymyers/git2jss/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
 
 A fast asynchronous python library for syncing your scripts in git with your JSS easily. This allows admins to keep their script in a version control system for easy updating rather than googling and copy-pasting from resources that they find online.
 
 ## Getting Started
+
 1. Fork the Project
 2. Install [Python version 3.6](https://www.python.org/downloads/) or higher. (this is because of the async requirements)
 3. Run `python3.6 -m pip install -r requirements.txt` to install required modules
@@ -38,10 +40,13 @@ A config file can be created in the project root or the users home folder. When 
 - url
 
 ### Prerequisites
+
 git2jss requires [Python 3.6](https://www.python.org/downloads/) and the python modules listed in `requirements.txt`
 
 ## Deployment
+
 The project can be ran ad-hoc with the example listed above, but ideally you setup webhooks and integrate into a CI/CD pipeline so each time a push is made to the repo your scripts are re-uploaded to the JSS.
 
 ## Contributing
+
 PR's are always welcome!
