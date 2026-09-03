@@ -149,13 +149,7 @@ def download_scripts(mode, overwrite=None):
     invalidate_uapi_token(token)
 
 
-if __name__ == "__main__":
-    # Export to current directory by default
-    export_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")
-    username = None
-    password = ""
-    url = None
-
+def parse_arguments():
     parser = argparse.ArgumentParser(description="Download Scripts from Jamf")
     parser.add_argument("--url")
     parser.add_argument("--username")
@@ -165,53 +159,72 @@ if __name__ == "__main__":
     parser.add_argument(
         "--do_not_verify_ssl", action="store_false"
     )  # Skips SSL verification
-    args = parser.parse_args()
-    # Get configs from files
+    return parser.parse_args()
+
+
+def load_config(default_export_path):
+    config = {
+        "username": None,
+        "password": "",
+        "url": None,
+        "export_path": default_export_path,
+    }
     CONFIG_FILE_LOCATIONS = ["jamfapi.cfg", os.path.expanduser("~/jamfapi.cfg")]
     CONFIG_FILE = ""
-    # Parse Config File
-    CONFPARSER = configparser.ConfigParser()
+    config_parser = configparser.ConfigParser()
     for config_path in CONFIG_FILE_LOCATIONS:
         if os.path.exists(config_path):
             print("Found Config: {0}".format(config_path))
             CONFIG_FILE = config_path
 
     if CONFIG_FILE != "":
-        # Get config
-        CONFPARSER.read(CONFIG_FILE)
-        try:
-            username = CONFPARSER.get("jss", "username")
-        except configparser.NoOptionError:
-            print("Can't find username in configfile")
-        try:
-            password = CONFPARSER.get("jss", "password")
-        except configparser.NoOptionError:
-            print("Can't find password in configfile")
-        try:
-            url = CONFPARSER.get("jss", "server")
-        except configparser.NoOptionError:
-            print("Can't find url in configfile")
-        try:
-            export_path = CONFPARSER.get("jss", "export_path")
-        except configparser.NoOptionError:
-            print("Can't find export_path in config")
+        config_parser.read(CONFIG_FILE)
+        config_options = {
+            "username": ("username", "Can't find username in configfile"),
+            "password": ("password", "Can't find password in configfile"),
+            "url": ("server", "Can't find url in configfile"),
+            "export_path": ("export_path", "Can't find export_path in config"),
+        }
+        for setting, (option, error_message) in config_options.items():
+            try:
+                config[setting] = config_parser.get("jss", option)
+            except configparser.NoOptionError:
+                print(error_message)
+    return config
 
-    # Ask for password if not supplied via command line args
-    if args.password:
-        password = args.password
-    elif not password:
-        password = getpass.getpass()
 
-    if args.export_path:
-        export_path = args.export_path
+def apply_cli_settings(config, parsed_args):
+    if parsed_args.password:
+        config["password"] = parsed_args.password
+    elif not config["password"]:
+        config["password"] = getpass.getpass()
 
-    if args.url:
-        url = args.url
+    if parsed_args.export_path:
+        config["export_path"] = parsed_args.export_path
+    if parsed_args.url:
+        config["url"] = parsed_args.url
+    if parsed_args.username:
+        config["username"] = parsed_args.username
+    return config
 
-    if args.username:
-        username = args.username
 
-    # Run script download for extension attributes
+def main():
+    global args, export_path, password, url, username
+
+    default_export_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")
+    parsed_args = parse_arguments()
+    config = load_config(default_export_path)
+    config = apply_cli_settings(config, parsed_args)
+
+    args = parsed_args
+    export_path = config["export_path"]
+    password = config["password"]
+    url = config["url"]
+    username = config["username"]
+
     download_scripts(overwrite=args.overwrite, mode="ea")
-    # Run script download for scripts
     download_scripts(overwrite=args.overwrite, mode="script")
+
+
+if __name__ == "__main__":
+    main()
