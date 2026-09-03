@@ -86,7 +86,7 @@ def build_computers_data_object(token, group_id):
     r = requests.get(
         url + "/JSSResource/computergroups/id/{0}".format(group_id),
         headers={"Content-Type": "application/xml", "Authorization": "Bearer " + token},
-        timeout=5
+        timeout=5,
     )
 
     tree = eTree.fromstring(r.content)
@@ -97,8 +97,11 @@ def build_computers_data_object(token, group_id):
         # Get detailed information about the record
         r = requests.get(
             url + "/JSSResource/computers/id/{0}".format(resource_id),
-            headers={"Content-Type": "application/json", "Authorization": "Bearer " + token},
-            timeout=5
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + token,
+            },
+            timeout=5,
         )
 
         # Parse xml
