@@ -153,6 +153,7 @@ if __name__ == "__main__":
     # Export to current directory by default
     export_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..")
     username = None
+    password = ""
     url = None
 
     parser = argparse.ArgumentParser(description="Download Scripts from Jamf")
@@ -198,7 +199,7 @@ if __name__ == "__main__":
     # Ask for password if not supplied via command line args
     if args.password:
         password = args.password
-    elif password is None:
+    elif not password:
         password = getpass.getpass()
 
     if args.export_path:
