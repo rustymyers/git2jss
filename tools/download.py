@@ -190,6 +190,8 @@ def load_config(default_export_path):
                 config[setting] = config_parser.get("jss", option)
             except configparser.NoOptionError:
                 print(error_message)
+    else:
+        print("No config file found, using command line creds")
     return config
 
 
