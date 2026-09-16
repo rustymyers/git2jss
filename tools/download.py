@@ -169,7 +169,7 @@ def load_config(default_export_path):
         "url": None,
         "export_path": default_export_path,
     }
-    CONFIG_FILE_LOCATIONS = ["jamfapi.cfg", os.path.expanduser("~/jamfapi.cfg")]
+    CONFIG_FILE_LOCATIONS = [os.path.expanduser("~/jamfapi.cfg"),"jamfapi.cfg"]
     CONFIG_FILE = ""
     config_parser = configparser.ConfigParser()
     for config_path in CONFIG_FILE_LOCATIONS:
