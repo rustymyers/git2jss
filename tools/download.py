@@ -15,7 +15,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # https://github.com/lazymutt/Jamf-Pro-API-Sampler/blob/5f8efa92911271248f527e70bd682db79bc600f2/jamf_duplicate_detection.py#L99
 def get_uapi_token():
     """fetches api token"""
-    jamf_test_url = url + "/api/v1/auth/token"
+    jamf_test_url = "".join([url, "/api/v1/auth/token"])
     response = requests.post(url=jamf_test_url, auth=(username, password), timeout=5)
     response_json = response.json()
     return response_json["token"]
@@ -23,7 +23,7 @@ def get_uapi_token():
 
 def invalidate_uapi_token(uapi_token):
     """invalidates api token"""
-    jamf_test_url = url + "/api/v1/auth/invalidate-token"
+    jamf_test_url = "".join([url, "/api/v1/auth/invalidate-token"])
     headers = {"Accept": "*/*", "Authorization": "Bearer " + uapi_token}
     _ = requests.post(url=jamf_test_url, headers=headers, timeout=5)
 
